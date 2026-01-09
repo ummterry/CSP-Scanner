@@ -13,6 +13,10 @@ async def main():
         print(f"Connecting to IBKR at {config.IB_HOST}:{config.IB_PORT} with Client ID {config.IB_CLIENT_ID}...")
         await ib.connectAsync(config.IB_HOST, config.IB_PORT, clientId=config.IB_CLIENT_ID)
         print("Connected to IBKR!")
+        
+        # Request Delayed Market Data (Type 3)
+        # This fixes "Requested market data requires additional subscription" errors for free/paper accounts
+        ib.reqMarketDataType(3) 
     except Exception as e:
         print(f"Failed to connect to IBKR: {e}")
         print("Please ensure TWS or IB Gateway is running and API ports are configured.")
@@ -50,7 +54,7 @@ async def main():
         current_price = ticker_data.last if not pd.isna(ticker_data.last) else ticker_data.close
         
         if pd.isna(current_price):
-             # Try requesting historical data for latest close if live data fails (e.g. weekend)
+            # Try requesting historical data for latest close if live data fails (e.g. weekend)
             bars = await ib.reqHistoricalDataAsync(
                 stock, endDateTime='', durationStr='1 D',
                 barSizeSetting='1 day', whatToShow='TRADES', useRTH=1
@@ -66,33 +70,37 @@ async def main():
         # 3. Get Option Chains
         chains = await ib.reqSecDefOptParamsAsync(stock.symbol, '', stock.secType, stock.conId)
         
-        # Flatten smart exchanges
-        smart_chains = [c for c in chains if c.exchange == 'SMART']
+        # Flatten smart exchanges and filter for standard options (multiplier 100)
+        smart_chains = [c for c in chains if c.exchange == 'SMART' and c.multiplier == '100']
         if not smart_chains:
             # Fallback if no SMART
-            smart_chains = chains
+            smart_chains = [c for c in chains if c.multiplier == '100']
         
-        # For simplicity, take the first valid chain set (usually contains all expirations/strikes)
         if not smart_chains:
              print(f"No option chains found for {ticker}")
              continue
              
-        chain = smart_chains[0]
+        # Aggregate all unique expirations from all chains
+        all_expirations = set()
+        for c in smart_chains:
+            all_expirations.update(c.expirations)
+        expirations = sorted(list(all_expirations))
         
-        # Filter Expirations
-        expirations = sorted(list(chain.expirations))
         import datetime
         today = datetime.date.today()
         
         target_dates = []
         for target_days in config.TARGET_DAYS_TO_EXPIRATION:
             target_date_approx = today + datetime.timedelta(days=target_days)
-            # Find closest expiration
-            # We look for something within +/- 7 days of target
-            # Or just take the closest one if we want to be robust
             
-            # Simple approach: closest future expiration
-            closest_date = min([d for d in expirations if datetime.datetime.strptime(d, '%Y%m%d').date() >= today], 
+            # Filter expirations to future only
+            future_exps = [d for d in expirations if datetime.datetime.strptime(d, '%Y%m%d').date() >= today]
+            
+            if not future_exps:
+                continue
+
+            # Find closest expiration
+            closest_date = min(future_exps, 
                                key=lambda x: abs((datetime.datetime.strptime(x, '%Y%m%d').date() - target_date_approx).days))
             
             if closest_date not in target_dates:
@@ -100,19 +108,36 @@ async def main():
         
         print(f"  Target Expirations: {target_dates}")
 
-        # Filter Strikes
-        target_max_strike = current_price * (1 - config.MIN_OTM_PCT)
-        target_min_strike = current_price * (1 - config.MAX_OTM_PCT)
-        
-        strikes = [k for k in chain.strikes if target_min_strike <= k <= target_max_strike]
-        print(f"  Target Strikes ({len(strikes)}): {strikes}")
-
         # Request Market Data for filtered options
         contracts = []
+        target_max_strike = current_price * (1 - config.MIN_OTM_PCT)
+        target_min_strike = current_price * (1 - config.MAX_OTM_PCT)
+
         for exp in target_dates:
-            for strike in strikes:
-                contract = Option(stock.symbol, exp, strike, 'P', 'SMART')
-                contracts.append(contract)
+            # Find chains that support this expiration
+            valid_chains = [c for c in smart_chains if exp in c.expirations]
+            
+            if not valid_chains:
+                continue
+
+            for chain in valid_chains:
+                # Filter strikes for this specific chain
+                chain_strikes = [k for k in chain.strikes if target_min_strike <= k <= target_max_strike]
+                
+                if not chain_strikes:
+                    continue
+                    
+                print(f"  For {exp} (Trading Class: {chain.tradingClass}): found {len(chain_strikes)} strikes")
+                
+                for strike in chain_strikes:
+                    # Use tradingClass to ensure we get the specific contract from this chain
+                    # This prevents Error 200 when SMART requires disambiguation
+                    contract = Option(stock.symbol, exp, strike, 'P', 'SMART', tradingClass=chain.tradingClass)
+                    contracts.append(contract)
+        
+        # Remove duplicates if multiple chains cover same contract (unlikely with different tradingClass but possible logic)
+        # Using a dictionary to unique-ify by key properties might be safer, but ib_insync qualify usually handles identicals.
+        # However, let's just proceed. The qualifyContractsAsync usually handles list of contracts fine.
         
         if not contracts:
              print("  No contracts found matching criteria.")
@@ -127,25 +152,62 @@ async def main():
         tickers = [ib.reqMktData(c, '', False, False) for c in contracts]
         
         # Wait for data
-        # Simple wait loop; in production use events
-        for _ in range(50):
+        for _ in range(100): # Increased wait time to 10s
             if all(t.bid != -1 or t.close != float('nan') for t in tickers): # Basic check
                 break
             await asyncio.sleep(0.1)
             
         # Process Results
+        print(f"  Processing {len(tickers)} Option Tickers...")
+        
+        # Identify contracts execution that need historical data
+        tasks = []
+        indices_needing_history = []
+        
+        for i, t in enumerate(tickers):
+            # Check if we have valid data
+            has_data = (t.bid > 0) or (not pd.isna(t.last) and t.last > 0) or (not pd.isna(t.close) and t.close > 0)
+            if not has_data:
+                # Request historical data for this contract
+                task = ib.reqHistoricalDataAsync(
+                    t.contract, endDateTime='', durationStr='1 D',
+                    barSizeSetting='1 day', whatToShow='MIDPOINT', useRTH=1
+                )
+                tasks.append(task)
+                indices_needing_history.append(i)
+        
+        if tasks:
+            print(f"  Fetching historical data for {len(tasks)} contracts (market closed/no data)...")
+            history_results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Update tickers/results with historical data
+            for i, result in zip(indices_needing_history, history_results):
+                if isinstance(result, list) and result:
+                    # We have bars
+                    close_price = result[-1].close
+                    # We can't update t.close directly effectively as it's a Ticker object from stream
+                    # But we can assume this is our premium for the logic below
+                    # Let's store it in a side map or just modify the processing loop to handle it
+                    tickers[i].__setattr__('temp_close', close_price)  # Monkey patch for local logic
+                else:
+                    tickers[i].__setattr__('temp_close', float('nan'))
+
         for t in tickers:
             contract = t.contract
             
             # Determine Premium
-            # Use bid price if available (conservative for selling), else last or close
-            # Note: IBKR returns -1 for empty bid
             premium = t.bid
             if premium <= 0:
                 premium = t.last if not pd.isna(t.last) else t.close
-                
+            
+            # Fallback to historical close if we fetched it
+            if (pd.isna(premium) or premium <= 0) and hasattr(t, 'temp_close'):
+                premium = t.temp_close
+
             if pd.isna(premium) or premium <= 0:
                 continue # Skip if no valid price data
+            
+            # Calculate Return
             
             # Calculate Return
             strike = contract.strike
@@ -162,14 +224,14 @@ async def main():
             
             results.append({
                 'Stock': contract.symbol,
+                'Price': current_price,
                 'Expiration': contract.lastTradeDateOrContractMonth,
                 'DTE': dte,
                 'Strike': strike,
-                'Price': current_price,
-                'OTM %': f"{(1 - strike/current_price)*100:.1f}%",
+                'OTM %': f"{(1 - strike/current_price)*100:.1f}",
                 'Premium': premium,
-                'ROI %': roi * 100,
-                'Ann. ROI %': annualized_roi * 100
+                'ROI %': round(roi * 100, 2),
+                'Ann. ROI %': round(annualized_roi * 100, 2)
             })
 
     # Summary
@@ -177,6 +239,12 @@ async def main():
         df = pd.DataFrame(results)
         df = df.sort_values('Ann. ROI %', ascending=False)
         print("\n" + tabulate(df, headers='keys', tablefmt='psql', floatfmt=".2f"))
+        
+        # Save to CSV
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        csv_file = f'scan_results_{timestamp}.csv'
+        df.to_csv(csv_file, index=False)
+        print(f"\nResults saved to {csv_file}")
     else:
         print("\nNo opportunities found.")
 

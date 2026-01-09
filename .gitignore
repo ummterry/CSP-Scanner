@@ -27,7 +27,10 @@ poetry.lock
 .venv
 
 # VS Code
-.vscode/
+# .vscode/
 
 # Environment variables
 .env
+
+# Output
+*.csv
