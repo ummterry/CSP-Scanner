@@ -30,3 +30,6 @@ IB_CLIENT_ID = 1
 
 # Other settings
 RISK_FREE_RATE = 0.04  # Used for Sharpe etc (future use), mainly placeholder now
+
+# Timezone for scanning
+TIMEZONE = 'America/New_York'

@@ -3,6 +3,9 @@ import sys
 from ib_insync import *
 import pandas as pd
 from tabulate import tabulate
+from tabulate import tabulate
+from zoneinfo import ZoneInfo
+import datetime
 import config
 
 async def main():
@@ -86,8 +89,10 @@ async def main():
             all_expirations.update(c.expirations)
         expirations = sorted(list(all_expirations))
         
-        import datetime
-        today = datetime.date.today()
+        # Use configured timezone for today's date
+        tz = ZoneInfo(config.TIMEZONE)
+        now = datetime.datetime.now(tz)
+        today = now.date()
         
         target_dates = []
         for target_days in config.TARGET_DAYS_TO_EXPIRATION:
@@ -241,7 +246,9 @@ async def main():
         print("\n" + tabulate(df, headers='keys', tablefmt='psql', floatfmt=".2f"))
         
         # Save to CSV
-        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        # Save to CSV (using configured timezone for filename timestamp)
+        # Note: 'now' is already timezone-aware from earlier
+        timestamp = now.strftime('%Y%m%d_%H%M%S')
         csv_file = f'scan_results_{timestamp}.csv'
         df.to_csv(csv_file, index=False)
         print(f"\nResults saved to {csv_file}")
