@@ -28,6 +28,47 @@ async def main():
     # 2. Main Scan Loop
     results = []
     
+    async def get_latest_price(contract):
+        # Try getting live data first (snapshot)
+        ticker = ib.reqMktData(contract, '', False, False) # Snapshot=False (stream) usually better for immediate
+        
+        # Wait up to 2 seconds for data
+        for _ in range(20):
+            if ticker.last == ticker.last and ticker.last > 0: # Check for not NaN and positive
+                 return ticker.last
+            await asyncio.sleep(0.1)
+        
+        # Check close if last is missing
+        price = ticker.last if (not pd.isna(ticker.last) and ticker.last > 0) else ticker.close
+        if not pd.isna(price) and price > 0:
+            return price
+            
+        # Fallback to historical data (1 week to cover holidays)
+        # Try TRADES first
+        print(f"    Fetching historical data (1W) for {contract.symbol}...")
+        try:
+            bars = await ib.reqHistoricalDataAsync(
+                contract, endDateTime='', durationStr='1 W',
+                barSizeSetting='1 day', whatToShow='TRADES', useRTH=1
+            )
+            if bars:
+                return bars[-1].close
+        except Exception:
+            pass # Ignore and try fallback
+            
+        # Try MIDPOINT fallback
+        try:
+            bars = await ib.reqHistoricalDataAsync(
+                contract, endDateTime='', durationStr='1 W',
+                barSizeSetting='1 day', whatToShow='MIDPOINT', useRTH=1
+            )
+            if bars:
+                return bars[-1].close
+        except Exception:
+            pass
+
+        return float('nan')
+
     for ticker in config.STOCKS:
         print(f"\nScanning {ticker}...")
         stock = Stock(ticker, 'SMART', 'USD')
@@ -44,29 +85,11 @@ async def main():
             continue
 
         # Get Market Data (Price)
-        # Snapshot=True to get a single point of data
-        ticker_data = ib.reqMktData(stock, '', False, False)
-        # Wait a bit for data to populate
-        # In a real app we might use events, but waiting is simple for a script
-        c = 0
-        while ticker_data.last != ticker_data.last and c < 50: # Wait until we have a last price or timeout
-            await asyncio.sleep(0.1)
-            c += 1
-            
-        # Fallback to close if last is NaN (e.g. after hours, though last usually persists)
-        current_price = ticker_data.last if not pd.isna(ticker_data.last) else ticker_data.close
-        
+        current_price = await get_latest_price(stock)
+
         if pd.isna(current_price):
-            # Try requesting historical data for latest close if live data fails (e.g. weekend)
-            bars = await ib.reqHistoricalDataAsync(
-                stock, endDateTime='', durationStr='1 D',
-                barSizeSetting='1 day', whatToShow='TRADES', useRTH=1
-            )
-            if bars:
-                current_price = bars[-1].close
-            else:
-                print(f"Could not get price for {ticker}")
-                continue
+            print(f"Could not get price for {ticker}")
+            continue
 
         print(f"{ticker} Price: {current_price}")
 
@@ -175,7 +198,7 @@ async def main():
             if not has_data:
                 # Request historical data for this contract
                 task = ib.reqHistoricalDataAsync(
-                    t.contract, endDateTime='', durationStr='1 D',
+                    t.contract, endDateTime='', durationStr='1 W',
                     barSizeSetting='1 day', whatToShow='MIDPOINT', useRTH=1
                 )
                 tasks.append(task)
